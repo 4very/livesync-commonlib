@@ -1,0 +1,29 @@
+{
+  "name": "livesync-commonlib",
+  "module": "src/index.ts",
+  "main": "src/index.ts",
+  "type": "module",
+  "devDependencies": {
+    "@types/pouchdb": "^6.4.0",
+    "@types/transform-pouch": "^1.0.4",
+    "bun-types": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "minimatch": "^9.0.3",
+    "pouchdb-adapter-http": "^8.0.1",
+    "pouchdb-adapter-idb": "^8.0.1",
+    "pouchdb-adapter-indexeddb": "^8.0.1",
+    "pouchdb-core": "^8.0.1",
+    "pouchdb-errors": "^8.0.1",
+    "pouchdb-find": "^8.0.1",
+    "pouchdb-mapreduce": "^8.0.1",
+    "pouchdb-merge": "^8.0.1",
+    "pouchdb-replication": "^8.0.1",
+    "pouchdb-utils": "^8.0.1",
+    "transform-pouch": "^2.0.0",
+    "xxhash-wasm": "^1.0.2"
+  }
+}
