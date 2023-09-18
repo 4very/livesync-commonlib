@@ -9,7 +9,7 @@ import { path2id_base, shouldSplitAsPlainText } from "./path.ts";
 import { splitPieces2 } from "./strbin.ts";
 import { type Task, processAllTasksWithConcurrencyLimit } from "./task.ts";
 import { type DocumentID, type FilePathWithPrefix, MAX_DOC_SIZE_BIN, type NewEntry, type PlainEntry, LOG_LEVEL_INFO, LOG_LEVEL_NOTICE, LOG_LEVEL_VERBOSE } from "./types.ts";
-import { default as xxhash, type XXHashAPI } from "xxhash-wasm-102";
+import { default as xxhash, type XXHashAPI } from "xxhash-wasm";
 
 
 export type DirectFileManipulatorOptions = {
