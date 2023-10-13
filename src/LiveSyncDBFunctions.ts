@@ -1,4 +1,4 @@
-import { runWithLock } from "./lock.ts";
+import { serialized } from "./lock.ts";
 import { Logger } from "./logger.ts";
 import { LRUCache } from "./LRUCache.ts";
 import { shouldSplitAsPlainText, stripAllPrefixes } from "./path.ts";
@@ -17,6 +17,7 @@ interface DBFunctionSettings {
     readChunksOnline: boolean;
     doNotPaceReplication: boolean;
     hashAlg: HashAlgorithm;
+    useV1: boolean;
 }
 // This interface is expected to be unnecessary because of the change in dependency direction
 export interface DBFunctionEnvironment {
@@ -49,7 +50,7 @@ export async function putDBEntry(
     let processed = 0;
     let made = 0;
     let skipped = 0;
-    const maxChunkSize = MAX_DOC_SIZE_BIN * Math.max(env.settings.customChunkSize, 1);
+    const maxChunkSize = Math.floor(MAX_DOC_SIZE_BIN * ((env.settings.customChunkSize || 0) * (env.settings.useV1 ? 1 : 0.1) + 1));
     const pieceSize = maxChunkSize;
     let plainSplit = false;
     let cacheUsed = 0;
@@ -63,7 +64,7 @@ export async function putDBEntry(
 
     const newLeafs: EntryLeaf[] = [];
 
-    const pieces = splitPieces2(note.data, pieceSize, plainSplit, minimumChunkSize, 0);
+    const pieces = splitPieces2(note.data, pieceSize, plainSplit, minimumChunkSize, filename, env.settings.useV1);
     const currentDocPiece = new Map<DocumentID, string>();
     let saved = true;
     for (const piece of pieces()) {
@@ -202,7 +203,7 @@ export async function putDBEntry(
             type: note.datatype,
         };
 
-        return await runWithLock("file:" + filename, false, async () => {
+        return await serialized("file:" + filename, async () => {
             try {
                 const old = await env.localDatabase.get(newDoc._id);
                 if (!old.type || old.type == "notes" || old.type == "newnote" || old.type == "plain") {
@@ -370,12 +371,12 @@ export async function getDBEntryFromMeta(env: DBFunctionEnvironment, obj: Loaded
                                 Logger(`Could not retrieve chunks of ${dispFilename}(${obj._id}). Chunks are missing:${missingChunks}`, LOG_LEVEL_NOTICE);
                                 return false;
                             }
-                            if (chunkDocs.rows.some(e => e.doc && e.doc.type != "leaf")) {
-                                const missingChunks = chunkDocs.rows.filter(e => e.doc && e.doc.type != "leaf").map(e => e.id).join(", ");
+                            if (chunkDocs.rows.some((e: any) => e.doc && e.doc.type != "leaf")) {
+                                const missingChunks = chunkDocs.rows.filter((e: any) => e.doc && e.doc.type != "leaf").map((e: any) => e.id).join(", ");
                                 Logger(`Could not retrieve chunks of ${dispFilename}(${obj._id}). corrupted chunks::${missingChunks}`, LOG_LEVEL_NOTICE);
                                 return false;
                             }
-                            children = chunkDocs.rows.map(e => (e.doc as EntryLeaf).data);
+                            children = chunkDocs.rows.map((e: any) => (e.doc as EntryLeaf).data);
                         }
                     } catch (ex) {
                         Logger(`Something went wrong on reading chunks of ${dispFilename}(${obj._id}) from database, see verbose info for detail.`, LOG_LEVEL_NOTICE);
@@ -438,7 +439,7 @@ export async function deleteDBEntry(env: DBFunctionEnvironment, path: FilePathWi
     const id = await env.path2id(path);
 
     try {
-        return await runWithLock("file:" + path, false, async () => {
+        return await serialized("file:" + path, async () => {
             let obj: EntryDocResponse | null = null;
             if (opt) {
                 obj = await env.localDatabase.get(id, opt);
@@ -454,12 +455,14 @@ export async function deleteDBEntry(env: DBFunctionEnvironment, path: FilePathWi
             //Check it out and fix docs to regular case
             if (!obj.type || (obj.type && obj.type == "notes")) {
                 obj._deleted = true;
-                const r = await env.localDatabase.put(obj);
+                const r = await env.localDatabase.put(obj, { force: !revDeletion });
+
                 Logger(`Entry removed:${path} (${obj._id}-${r.rev})`);
                 if (typeof env.corruptedEntries[obj._id] != "undefined") {
                     delete env.corruptedEntries[obj._id];
                 }
                 return true;
+
                 // simple note
             }
             if (obj.type == "newnote" || obj.type == "plain") {
@@ -472,11 +475,13 @@ export async function deleteDBEntry(env: DBFunctionEnvironment, path: FilePathWi
                         obj._deleted = true;
                     }
                 }
-                const r = await env.localDatabase.put(obj);
+                const r = await env.localDatabase.put(obj, { force: !revDeletion });
+
                 Logger(`Entry removed:${path} (${obj._id}-${r.rev})`);
                 if (typeof env.corruptedEntries[obj._id] != "undefined") {
                     delete env.corruptedEntries[obj._id];
                 }
+
                 return true;
             } else {
                 return false;
@@ -521,7 +526,7 @@ export async function deleteDBEntryPrefix(env: DBFunctionEnvironment, prefix: Fi
     let notfound = 0;
     for (const v of delDocs) {
         try {
-            await runWithLock("file:" + v, false, async () => {
+            await serialized("file:" + v, async () => {
                 const item = await env.localDatabase.get(v);
                 if (item.type == "newnote" || item.type == "plain") {
                     item.deleted = true;
@@ -532,7 +537,7 @@ export async function deleteDBEntryPrefix(env: DBFunctionEnvironment, prefix: Fi
                 } else {
                     item._deleted = true;
                 }
-                await env.localDatabase.put(item);
+                await env.localDatabase.put(item, { force: true });
             });
 
             deleteCount++;

@@ -21,14 +21,14 @@ import { isErrorOfMissingDoc } from "./utils_couchdb.ts";
 import { LRUCache } from "./LRUCache.ts";
 
 import { putDBEntry, getDBEntry, getDBEntryMeta, deleteDBEntry, deleteDBEntryPrefix, type DBFunctionEnvironment } from "./LiveSyncDBFunctions.ts";
-import { runWithLock } from "./lock.ts";
+import { skipIfDuplicated } from "./lock.ts";
 import type { LiveSyncDBReplicator } from "./LiveSyncReplicator.ts";
 import { writeString } from "./strbin.ts";
 
 export interface LiveSyncLocalDBEnv {
     id2path(id: DocumentID, entry: EntryHasPath, stripPrefix?: boolean): FilePathWithPrefix;
     path2id(filename: FilePathWithPrefix | FilePath, prefix?: string): Promise<DocumentID>;
-    createPouchDBInstance<T>(name?: string, options?: PouchDB.Configuration.DatabaseConfiguration): PouchDB.Database<T>
+    createPouchDBInstance<T extends object>(name?: string, options?: PouchDB.Configuration.DatabaseConfiguration): PouchDB.Database<T>
 
     beforeOnUnload(db: LiveSyncLocalDB): void;
     onClose(db: LiveSyncLocalDB): void;
@@ -185,7 +185,7 @@ export class LiveSyncLocalDB implements DBFunctionEnvironment {
         } catch (ex: any) {
             if (isErrorOfMissingDoc(ex)) {
                 if (limitTime < now) {
-                    throw new Error("Could not read chunk: Timed out: ${id}");
+                    throw new Error(`Could not read chunk: Timed out: ${id}`);
                 }
                 await waitForSignal(`leaf-${id}`, 5000);
                 return this.getDBLeafWithTimeout(id, limitTime);
@@ -325,7 +325,7 @@ export class LiveSyncLocalDB implements DBFunctionEnvironment {
     }
     execCollect() {
         // do not await.
-        runWithLock("execCollect", true, async () => {
+        skipIfDuplicated("execCollect", async () => {
             do {
                 const minimumInterval = this.settings.minimumIntervalOfReadChunksOnline; // three requests per second as maximum
                 const start = Date.now();
@@ -406,14 +406,14 @@ export class LiveSyncLocalDB implements DBFunctionEnvironment {
     async *findEntries(startKey: string, endKey: string, opt: PouchDB.Core.AllDocsWithKeyOptions | PouchDB.Core.AllDocsOptions | PouchDB.Core.AllDocsWithKeysOptions | PouchDB.Core.AllDocsWithinRangeOptions) {
         const pageLimit = 100;
         let nextKey = startKey;
-        let req = this.localDatabase.allDocs({ limit: pageLimit, startkey: nextKey, endkey: endKey, include_docs: true, ...opt });
+        let req = this.allDocsRaw({ limit: pageLimit, startkey: nextKey, endkey: endKey, include_docs: true, ...opt });
         do {
             const docs = await req;
             if (docs.rows.length === 0) {
                 break;
             }
-            nextKey = `${docs.rows[docs.rows.length - 1].id}\u{10ffff}`;
-            req = this.localDatabase.allDocs({ limit: pageLimit, startkey: nextKey, endkey: endKey, include_docs: true, ...opt });
+            nextKey = `${docs.rows[docs.rows.length - 1].id}`;
+            req = this.allDocsRaw({ limit: pageLimit, skip: 1, startkey: nextKey, endkey: endKey, include_docs: true, ...opt });
             for (const row of docs.rows) {
                 const doc = row.doc;
                 if (!("type" in doc)) continue;
@@ -425,27 +425,29 @@ export class LiveSyncLocalDB implements DBFunctionEnvironment {
         } while (nextKey != "");
     }
     async *findAllDocs(opt?: PouchDB.Core.AllDocsWithKeyOptions | PouchDB.Core.AllDocsOptions | PouchDB.Core.AllDocsWithKeysOptions | PouchDB.Core.AllDocsWithinRangeOptions) {
-        const f1 = this.findEntries("", "h:", opt ?? {});
-        const f2 = this.findEntries(`h:\u{10ffff}`, "", opt ?? {});
-        for await (const f of f1) {
-            yield f;
-        }
-        for await (const f of f2) {
-            yield f;
+        const targets = [
+            () => this.findEntries("_\u{10ffff}", "h:", opt ?? {}),
+            () => this.findEntries(`h:\u{10ffff}`, "", opt ?? {}),
+        ]
+        for (const targetFun of targets) {
+            const target = targetFun();
+            for await (const f of target) {
+                yield f;
+            }
         }
     }
     async *findEntryNames(startKey: string, endKey: string, opt: PouchDB.Core.AllDocsWithKeyOptions | PouchDB.Core.AllDocsOptions | PouchDB.Core.AllDocsWithKeysOptions | PouchDB.Core.AllDocsWithinRangeOptions) {
         const pageLimit = 100;
         let nextKey = startKey;
-        let req = this.localDatabase.allDocs({ limit: pageLimit, startkey: nextKey, endkey: endKey, ...opt });
+        let req = this.allDocsRaw({ limit: pageLimit, startkey: nextKey, endkey: endKey, ...opt });
         do {
             const docs = await req;
             if (docs.rows.length == 0) {
                 nextKey = "";
                 break;
             }
-            nextKey = `${docs.rows[docs.rows.length - 1].key}\u{10ffff}`;
-            req = this.localDatabase.allDocs({ limit: pageLimit, startkey: nextKey, endkey: endKey, ...opt });
+            nextKey = `${docs.rows[docs.rows.length - 1].key}`;
+            req = this.allDocsRaw({ limit: pageLimit, skip: 1, startkey: nextKey, endkey: endKey, ...opt });
             for (const row of docs.rows) {
                 yield row.id;
             }
@@ -453,14 +455,15 @@ export class LiveSyncLocalDB implements DBFunctionEnvironment {
     }
     async *findAllDocNames(opt?: PouchDB.Core.AllDocsWithKeyOptions | PouchDB.Core.AllDocsOptions | PouchDB.Core.AllDocsWithKeysOptions | PouchDB.Core.AllDocsWithinRangeOptions) {
         const targets = [
-            this.findEntryNames("", "h:", opt ?? {}),
-            this.findEntryNames(`h:\u{10ffff}`, "i:", opt ?? {}),
-            this.findEntryNames(`i:\u{10ffff}`, "ix:", opt ?? {}),
-            this.findEntryNames(`ix:\u{10ffff}`, "ps:", opt ?? {}),
-            this.findEntryNames(`ps:\u{10ffff}`, "", opt ?? {}),
+            () => this.findEntryNames("_\u{10ffff}", "h:", opt ?? {}),
+            () => this.findEntryNames(`h:\u{10ffff}`, "i:", opt ?? {}),
+            () => this.findEntryNames(`i:\u{10ffff}`, "ix:", opt ?? {}),
+            () => this.findEntryNames(`ix:\u{10ffff}`, "ps:", opt ?? {}),
+            () => this.findEntryNames(`ps:\u{10ffff}`, "", opt ?? {}),
 
         ]
-        for (const target of targets) {
+        for (const targetFun of targets) {
+            const target = targetFun();
             for await (const f of target) {
                 if (f.startsWith("_")) continue;
                 if (f == VERSIONINFO_DOCID) continue;
@@ -470,13 +473,14 @@ export class LiveSyncLocalDB implements DBFunctionEnvironment {
     }
     async *findAllNormalDocs(opt?: PouchDB.Core.AllDocsWithKeyOptions | PouchDB.Core.AllDocsOptions | PouchDB.Core.AllDocsWithKeysOptions | PouchDB.Core.AllDocsWithinRangeOptions) {
         const targets = [
-            this.findEntries("", "h:", opt ?? {}),
-            this.findEntries(`h:\u{10ffff}`, "i:", opt ?? {}),
-            this.findEntries(`i:\u{10ffff}`, "ix:", opt ?? {}),
-            this.findEntries(`ix:\u{10ffff}`, "ps:", opt ?? {}),
-            this.findEntries(`ps:\u{10ffff}`, "", opt ?? {}),
+            () => this.findEntries("_\u{10ffff}", "h:", opt ?? {}),
+            () => this.findEntries(`h:\u{10ffff}`, "i:", opt ?? {}),
+            () => this.findEntries(`i:\u{10ffff}`, "ix:", opt ?? {}),
+            () => this.findEntries(`ix:\u{10ffff}`, "ps:", opt ?? {}),
+            () => this.findEntries(`ps:\u{10ffff}`, "", opt ?? {}),
         ]
-        for (const target of targets) {
+        for (const targetFun of targets) {
+            const target = targetFun();
             for await (const f of target) {
                 if (f._id.startsWith("_")) continue;
                 if (f.type != "newnote" && f.type != "plain") continue;
@@ -498,9 +502,9 @@ export class LiveSyncLocalDB implements DBFunctionEnvironment {
         return this.localDatabase.put(doc, options || {})
     }
 
-    allDocsRaw<T>(options?: PouchDB.Core.AllDocsWithKeyOptions | PouchDB.Core.AllDocsWithKeysOptions | PouchDB.Core.AllDocsWithinRangeOptions | PouchDB.Core.AllDocsOptions):
+    allDocsRaw<T extends EntryDoc>(options?: PouchDB.Core.AllDocsWithKeyOptions | PouchDB.Core.AllDocsWithKeysOptions | PouchDB.Core.AllDocsWithinRangeOptions | PouchDB.Core.AllDocsOptions):
         Promise<PouchDB.Core.AllDocsResponse<T>> {
-        return this.localDatabase.allDocs(options);
+        return this.localDatabase.allDocs<T>(options);
     }
 
     bulkDocsRaw<T extends EntryDoc>(docs: Array<PouchDB.Core.PutDocument<T>>, options?: PouchDB.Core.BulkDocsOptions): Promise<Array<PouchDB.Core.Response | PouchDB.Core.Error>> {
@@ -513,11 +517,11 @@ export class LiveSyncLocalDB implements DBFunctionEnvironment {
         const notExists = exists.filter(e => e.chunk === false);
         if (notExists.length > 0) {
             const chunks = await this.localDatabase.allDocs({ keys: notExists.map(e => e.id), include_docs: true });
-            const existChunks = chunks.rows.filter(e => !("error" in e)).map(e => e.doc as EntryLeaf);
+            const existChunks = chunks.rows.filter(e => !("error" in e)).map((e: any) => e.doc as EntryLeaf);
             // If the chunks are missing, possibly backed up while cleaning up.
             const nonExistsLocal = chunks.rows.filter(e => ("error" in e)).map(e => e.key);
             const purgedChunks = await this.localDatabase.allDocs({ keys: nonExistsLocal.map(e => `_local/${e}`), include_docs: true });
-            const existChunksPurged = purgedChunks.rows.filter(e => !("error" in e)).map(e => ({ ...e.doc, _id: e.id.substring(7) }) as EntryLeaf);
+            const existChunksPurged = purgedChunks.rows.filter(e => !("error" in e)).map((e: any) => ({ ...e.doc, _id: e.id.substring(7) }) as EntryLeaf);
             const temp = [...existChunks, ...existChunksPurged].reduce((p, c) => ({ ...p, [c._id]: c.data }), {}) as { [key: DocumentID]: string };
             for (const chunk of existChunks) {
                 this.hashCaches.set(chunk._id, chunk.data);
